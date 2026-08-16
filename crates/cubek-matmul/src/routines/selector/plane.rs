@@ -338,7 +338,7 @@ fn selection_tiny<R: Runtime>(
     tile_matmul: TileMatmulKind,
 ) -> BatchMatmulBlueprint {
     // If the K axis is big, we can leverage that.
-    let pk = u32::min(problem.k as u32 / tile_size.k(), 8);
+    let pk = u32::min(problem.k as u32 / tile_size.k(), 32);
     let pk = u32::max(pk, 1);
 
     let tiling_scheme = TilingScheme::builder()
