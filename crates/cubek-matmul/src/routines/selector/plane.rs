@@ -111,7 +111,19 @@ pub fn infer_blueprint_plane<R: Runtime>(
         if problem.m as u32 <= tile_size.m() * 4 || problem.n as u32 <= tile_size.n() * 4 {
             tile_factor = 8;
         }
-        max_plane_per_cube / (tile_factor * precision_factor)
+        let row_count = max_plane_per_cube / (tile_factor * precision_factor);
+
+        match client.properties().hardware.num_streaming_multiprocessors {
+            Some(num_sms) => clamp_row_count_to_sms(
+                row_count,
+                tile_size,
+                problem.m,
+                problem.n,
+                problem.num_batches(),
+                num_sms,
+            ),
+            None => row_count,
+        }
     });
 
     if row_count == 0 {
@@ -284,6 +296,48 @@ fn select_size(
     (rows, plane_count / rows, plane_count)
 }
 
+/// Cubes the grid gets for a stage `row_count` planes wide, mirroring the target cube
+/// count in [`BatchMatmulBlueprint::cube_launch_info`]: `row_count` planes along `m` and
+/// `row_count` tiles along `n`, over a grid whose axes are `m`, `n` and batch.
+fn grid_cube_count(
+    tile_size: TileSize,
+    m: usize,
+    n: usize,
+    num_batches: usize,
+    row_count: u32,
+) -> u32 {
+    let elements_along_m = row_count * tile_size.m();
+    let elements_along_n = row_count * tile_size.n();
+
+    (m as u32).div_ceil(elements_along_m)
+        * (n as u32).div_ceil(elements_along_n)
+        * num_batches as u32
+}
+
+/// Narrow the stage until the grid holds at least one cube per SM.
+///
+/// The grid has no `k` axis, so every extra plane in the stage buys tile area at the cost
+/// of cubes. A problem with a small output and a long reduction — a convolution weight
+/// gradient, where `m` is the output channel count and `k` carries batch and spatial
+/// extent — has no area to give, and the widest stage the register budget allows leaves
+/// most SMs without a cube at all.
+fn clamp_row_count_to_sms(
+    row_count: u32,
+    tile_size: TileSize,
+    m: usize,
+    n: usize,
+    num_batches: usize,
+    num_sms: u32,
+) -> u32 {
+    let mut row_count = row_count;
+
+    while row_count > 1 && grid_cube_count(tile_size, m, n, num_batches, row_count) < num_sms {
+        row_count /= 2;
+    }
+
+    row_count
+}
+
 /// The instruction shape for this problem — [`cubek_std::find_instruction_size`]
 /// with matmul's own error on the empty case, and the client and element triple
 /// bound into its capability closures. The ladder itself is shape-only and takes
@@ -398,5 +452,52 @@ mod tests {
             // With a single plane we can only fit a single row per plane.
             assert!(rows_per_plane <= plane_count);
         }
+    }
+
+    /// One H100, whose SM count the two tests below use.
+    const NUM_SMS: u32 = 132;
+
+    /// The weight gradient of `conv2d(batch 256, channels 64, 32x32, 64 filters, 3x3)`,
+    /// which reaches matmul as `m=64, n=576, k=262144`. The register heuristic asks for 2
+    /// planes in f32 and 4 in bf16, which give 36 and 10 cubes — 27% and 7.6% of the
+    /// device. Both must come back with a grid that covers every SM.
+    #[test]
+    fn clamp_row_count_fills_the_device_on_a_long_reduction() {
+        let tile_size = TileSize::new(8, 32, 16);
+        let (m, n, num_batches) = (64, 576, 1);
+
+        for row_count in [2, 4] {
+            let clamped = clamp_row_count_to_sms(row_count, tile_size, m, n, num_batches, NUM_SMS);
+
+            assert!(
+                grid_cube_count(tile_size, m, n, num_batches, clamped) >= NUM_SMS,
+                "row_count {row_count} clamped to {clamped}, which still starves the device"
+            );
+        }
+    }
+
+    /// The forward pass of the same convolution, `m=262144, n=64, k=576`. Its grid already
+    /// covers the device, so the stage must be left exactly as the heuristic set it.
+    #[test]
+    fn clamp_row_count_leaves_a_saturated_grid_alone() {
+        let tile_size = TileSize::new(32, 8, 16);
+
+        assert_eq!(
+            clamp_row_count_to_sms(8, tile_size, 262144, 64, 1, NUM_SMS),
+            8
+        );
+    }
+
+    /// Batches are cubes too: 64 independent 128x128 matmuls saturate the device with 4
+    /// planes per stage, so the stage must survive. Counting only `m` and `n` would give 4
+    /// cubes here and narrow the stage for nothing.
+    #[test]
+    fn clamp_row_count_counts_batches() {
+        let tile_size = TileSize::new(16, 16, 16);
+
+        assert_eq!(
+            clamp_row_count_to_sms(4, tile_size, 128, 128, 64, NUM_SMS),
+            4
+        );
     }
 }
