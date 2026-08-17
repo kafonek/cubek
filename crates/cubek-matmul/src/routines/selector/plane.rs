@@ -25,6 +25,20 @@ use crate::{
 pub const NUM_SM_APPROX: u32 = 50;
 pub const NUM_TENSOR_CORES_APPROX: u32 = 4;
 
+/// Sweep instrumentation: read the tiny selector's in-cube K partition cap from the environment.
+/// `CUBEK_TINY_PARTITION_K_MAX` defaults to the upstream constant 8. This exists so one binary can
+/// measure several cap values; the value that ships is a plain constant.
+fn tiny_partition_k_cap() -> u32 {
+    static CAP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("CUBEK_TINY_PARTITION_K_MAX")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| *value >= 1)
+            .unwrap_or(8)
+    })
+}
+
 #[derive(Debug)]
 /// Options to select the best plane matmul [selection](BatchMatmulBlueprint).
 pub struct PlaneTilingBlueprintOptions {
@@ -338,7 +352,7 @@ fn selection_tiny<R: Runtime>(
     tile_matmul: TileMatmulKind,
 ) -> BatchMatmulBlueprint {
     // If the K axis is big, we can leverage that.
-    let pk = u32::min(problem.k as u32 / tile_size.k(), 8);
+    let pk = u32::min(problem.k as u32 / tile_size.k(), tiny_partition_k_cap());
     let pk = u32::max(pk, 1);
 
     let tiling_scheme = TilingScheme::builder()
