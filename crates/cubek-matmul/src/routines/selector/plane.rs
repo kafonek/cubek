@@ -25,6 +25,19 @@ use crate::{
 pub const NUM_SM_APPROX: u32 = 50;
 pub const NUM_TENSOR_CORES_APPROX: u32 = 4;
 
+/// `cuTensorMapEncodeTiled` rejects a box dimension above 256 elements.
+const MAX_TMA_BOX_ELEMENTS: u32 = 256;
+
+/// The deepest in-cube K partition [`selection_tiny`] may ask for at a given tile depth.
+///
+/// The tiny blueprint uses a single stage, so its stage spans `partition_k * tile_size.k()`
+/// elements along K, and a TMA loader maps that span onto one tensor-map box dimension. Past the
+/// box limit every TMA candidate fails to launch, and on CUDA that failure poisons the context
+/// instead of dropping the candidate.
+fn max_partition_k(tile_size_k: u32) -> u32 {
+    u32::max(MAX_TMA_BOX_ELEMENTS / tile_size_k, 1)
+}
+
 #[derive(Debug)]
 /// Options to select the best plane matmul [selection](BatchMatmulBlueprint).
 pub struct PlaneTilingBlueprintOptions {
@@ -338,7 +351,10 @@ fn selection_tiny<R: Runtime>(
     tile_matmul: TileMatmulKind,
 ) -> BatchMatmulBlueprint {
     // If the K axis is big, we can leverage that.
-    let pk = u32::min(problem.k as u32 / tile_size.k(), 32);
+    let pk = u32::min(
+        problem.k as u32 / tile_size.k(),
+        max_partition_k(tile_size.k()),
+    );
     let pk = u32::max(pk, 1);
 
     let tiling_scheme = TilingScheme::builder()
@@ -400,5 +416,25 @@ mod tests {
             // With a single plane we can only fit a single row per plane.
             assert!(rows_per_plane <= plane_count);
         }
+    }
+
+    #[test]
+    fn max_partition_k_keeps_the_stage_inside_the_tma_box() {
+        for tile_size_k in [1u32, 2, 4, 8, 16, 32, 64, 128, 256] {
+            let partition_k = max_partition_k(tile_size_k);
+            assert!(partition_k >= 1, "partition_k must stay launchable");
+            assert!(
+                partition_k * tile_size_k <= MAX_TMA_BOX_ELEMENTS,
+                "tile_size_k {tile_size_k} yields a {} element stage",
+                partition_k * tile_size_k
+            );
+        }
+    }
+
+    /// A tile depth past the box limit still has to produce a usable partition.
+    #[test]
+    fn max_partition_k_is_never_zero() {
+        assert_eq!(max_partition_k(512), 1);
+        assert_eq!(max_partition_k(8), 32);
     }
 }
